@@ -139,16 +139,17 @@ impl<'a> Link<'a> {
     fn render_with_path(&self, base: &Path, outdir: &Path) -> Result<String> {
         match self.link_type {
             LinkType(ref pat) => {
-                let target = base.join(pat);
+                let target = base
+                    .join(pat)
+                    .canonicalize()
+                    .with_context(|| format!("{}/{}", base.display(), pat.display()))?;
 
                 let ext = "svg";
 
                 let image = Path::new(
-                    target
-                        .file_name()
+                    pat.file_name()
                         .with_context(|| "plantuml path was not file")?,
-                );
-                let image = outdir.join(image.with_extension(ext));
+                ).with_extension(ext);
 
                 let status = Command::new("sh")
                     .arg("-c")
@@ -214,7 +215,7 @@ mod tests {
 
     #[test]
     fn test_find_links_simple_link() {
-        let s = "Some random text with {{#plantuml file.puml}} and {{#plantuml test.puml }}...";
+        let s = "Some random text with {{#plantuml file.puml}} and {{#plantuml ../nested/test.puml }}...";
 
         let res = find_links(s).collect::<Vec<_>>();
         println!("\nOUTPUT: {:?}\n", res);
@@ -230,11 +231,32 @@ mod tests {
                 },
                 Link {
                     start_index: 50,
-                    end_index: 74,
-                    link_type: LinkType(PathBuf::from("test.puml")),
-                    link_text: "{{#plantuml test.puml }}",
+                    end_index: 84,
+                    link_type: LinkType(PathBuf::from("../nested/test.puml")),
+                    link_text: "{{#plantuml ../nested/test.puml }}",
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn replace() {
+        env_logger::init();
+
+        let root = std::env::current_dir().unwrap();
+
+        let s = "Some random text with {{#plantuml file.puml}} and {{#plantuml ../nested/test.puml }}...";
+        let path = root.join("src");
+        let source = PathBuf::from("foo.md");
+        let outdir = path.join("plantuml_images");
+
+        let res = replace_all(s, &path, &source, &outdir, 0);
+
+        println!("\nOUTPUT: {:?}\n", res);
+
+        assert_eq!(
+            res,
+            "Some random text with <img src=\"/plantuml_images/file.svg\" /> and <img src=\"/plantuml_images/test.svg\" />..."
         );
     }
 }

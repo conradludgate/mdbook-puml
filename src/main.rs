@@ -16,6 +16,8 @@ pub fn make_app() -> App<'static, 'static> {
 }
 
 fn main() {
+    env_logger::init();
+
     let matches = make_app().get_matches();
 
     let preprocessor = mdbook_puml::PumlPreprocessor;
