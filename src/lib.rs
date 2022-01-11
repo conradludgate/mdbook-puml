@@ -12,6 +12,7 @@ extern crate log;
 
 const MAX_LINK_NESTED_DEPTH: usize = 10;
 const REL_OUTDIR: &str = "plantuml_images";
+const SVG: &str = "svg";
 
 /// A preprocessor for expanding helpers in a chapter. Supported helpers are:
 ///
@@ -27,6 +28,8 @@ impl Preprocessor for PumlPreprocessor {
         let src_dir = ctx.root.join(&ctx.config.book.src);
         let outdir = src_dir.join(REL_OUTDIR);
 
+        let mut plantuml_script = format!("plantuml -t{} -o {} -nometadata", SVG, outdir.display());
+
         book.for_each_mut(|section: &mut BookItem| {
             if let BookItem::Chapter(ref mut ch) = *section {
                 if let Some(ref chapter_path) = ch.path {
@@ -35,17 +38,41 @@ impl Preprocessor for PumlPreprocessor {
                         .map(|dir| src_dir.join(dir))
                         .expect("All book items have a parent");
 
-                    let content = replace_all(&ch.content, &base, chapter_path, &outdir, 0);
+                    let content = replace_all(
+                        &ch.content,
+                        &base,
+                        chapter_path,
+                        &outdir,
+                        0,
+                        &mut plantuml_script,
+                    );
                     ch.content = content;
                 }
             }
         });
 
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(plantuml_script)
+            .status()
+            .with_context(|| "could not run plantuml")?;
+
+        if !status.success() {
+            bail!("could not run plantuml");
+        }
+
         Ok(book)
     }
 }
 
-fn replace_all(s: &str, path: &Path, source: &Path, outdir: &Path, depth: usize) -> String {
+fn replace_all(
+    s: &str,
+    path: &Path,
+    source: &Path,
+    outdir: &Path,
+    depth: usize,
+    targets: &mut String,
+) -> String {
     // When replacing one thing in a string by something with a different length,
     // the indices after that will not correspond,
     // we therefore have to store the difference to correct this
@@ -55,16 +82,26 @@ fn replace_all(s: &str, path: &Path, source: &Path, outdir: &Path, depth: usize)
     for link in find_links(s) {
         replaced.push_str(&s[previous_end_index..link.start_index]);
 
-        match link.render_with_path(path, outdir) {
+        let target = path
+            .join(&link.path)
+            .canonicalize()
+            .with_context(|| format!("{}/{}", path.display(), link.path.display()))
+            .unwrap();
+        targets.push_str(" \"");
+        targets.push_str(&target.to_string_lossy());
+        targets.push('"');
+
+        match link.render() {
             Ok(new_content) => {
                 if depth < MAX_LINK_NESTED_DEPTH {
-                    let rel_path = link.link_type.relative_path(path);
+                    let rel_path = return_relative_path(path, &link.path);
                     replaced.push_str(&replace_all(
                         &new_content,
                         &rel_path,
                         source,
                         outdir,
                         depth + 1,
+                        targets,
                     ));
                 } else {
                     error!(
@@ -91,17 +128,8 @@ fn replace_all(s: &str, path: &Path, source: &Path, outdir: &Path, depth: usize)
     replaced
 }
 
-#[derive(PartialEq, Debug, Clone)]
-struct LinkType(PathBuf);
-
-impl LinkType {
-    fn relative_path<P: AsRef<Path>>(self, base: P) -> PathBuf {
-        let base = base.as_ref();
-        return_relative_path(base, &self.0)
-    }
-}
-fn return_relative_path<P: AsRef<Path>>(base: P, relative: P) -> PathBuf {
-    base.as_ref()
+fn return_relative_path(base: &Path, relative: &Path) -> PathBuf {
+    base
         .join(relative)
         .parent()
         .expect("Included file should not be /")
@@ -112,67 +140,43 @@ fn return_relative_path<P: AsRef<Path>>(base: P, relative: P) -> PathBuf {
 struct Link<'a> {
     start_index: usize,
     end_index: usize,
-    link_type: LinkType,
+    path: PathBuf,
     link_text: &'a str,
 }
 
 impl<'a> Link<'a> {
     fn from_capture(cap: Captures<'a>) -> Option<Link<'a>> {
-        let link_type = match cap.get(1) {
+        let path = match cap.get(1) {
             Some(rest) => {
                 let mut path_props = rest.as_str().split_whitespace();
-                path_props.next().map(|p| LinkType(p.into()))
+                path_props.next().map(PathBuf::from)
             }
             _ => None,
         };
 
-        link_type.and_then(|lnk_type| {
+        path.and_then(|path| {
             cap.get(0).map(|mat| Link {
                 start_index: mat.start(),
                 end_index: mat.end(),
-                link_type: lnk_type,
+                path,
                 link_text: mat.as_str(),
             })
         })
     }
 
-    fn render_with_path(&self, base: &Path, outdir: &Path) -> Result<String> {
-        match self.link_type {
-            LinkType(ref pat) => {
-                let target = base
-                    .join(pat)
-                    .canonicalize()
-                    .with_context(|| format!("{}/{}", base.display(), pat.display()))?;
+    fn render(&self) -> Result<String> {
+        let image = Path::new(
+            self.path
+                .file_name()
+                .with_context(|| "plantuml path was not file")?,
+        )
+        .with_extension(SVG);
 
-                let ext = "svg";
-
-                let image = Path::new(
-                    pat.file_name()
-                        .with_context(|| "plantuml path was not file")?,
-                ).with_extension(ext);
-
-                let status = Command::new("sh")
-                    .arg("-c")
-                    .arg(format!(
-                        "plantuml -t{} -o {} -nometadata {}",
-                        ext,
-                        outdir.display(),
-                        target.display()
-                    ))
-                    .status()
-                    .with_context(|| "could not run plantuml")?;
-
-                if !status.success() {
-                    bail!("could not run plantuml");
-                }
-
-                Ok(format!(
-                    r#"<img src="/{}/{}" />"#,
-                    REL_OUTDIR,
-                    image.display()
-                ))
-            }
-        }
+        Ok(format!(
+            r#"<img src="/{}/{}" />"#,
+            REL_OUTDIR,
+            image.display()
+        ))
     }
 }
 
@@ -226,13 +230,13 @@ mod tests {
                 Link {
                     start_index: 22,
                     end_index: 45,
-                    link_type: LinkType(PathBuf::from("file.puml")),
+                    path: PathBuf::from("file.puml"),
                     link_text: "{{#plantuml file.puml}}",
                 },
                 Link {
                     start_index: 50,
                     end_index: 84,
-                    link_type: LinkType(PathBuf::from("../nested/test.puml")),
+                    path: PathBuf::from("../nested/test.puml"),
                     link_text: "{{#plantuml ../nested/test.puml }}",
                 },
             ]
@@ -250,7 +254,9 @@ mod tests {
         let source = PathBuf::from("foo.md");
         let outdir = path.join("plantuml_images");
 
-        let res = replace_all(s, &path, &source, &outdir, 0);
+        let mut targets = String::new();
+
+        let res = replace_all(s, &path, &source, &outdir, 0, &mut targets);
 
         println!("\nOUTPUT: {:?}\n", res);
 
