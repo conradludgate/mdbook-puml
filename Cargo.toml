@@ -1,0 +1,16 @@
+[package]
+name = "mdbook-puml"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+mdbook = { version = "0.4.15", default-features = false }
+regex = "1.5.4"
+anyhow = "1.0.28"
+clap = "2.24"
+semver = "1.0.4"
+log = "0.4.14"
+lazy_static = "1.4.0"
+serde_json = "1.0.74"
