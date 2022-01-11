@@ -303,7 +303,7 @@ dependencies = [
 
 [[package]]
 name = "mdbook-puml"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "clap",

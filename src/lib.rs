@@ -4,6 +4,7 @@ use mdbook::book::Book;
 use mdbook::preprocess::{Preprocessor, PreprocessorContext};
 use mdbook::BookItem;
 use regex::{CaptureMatches, Captures, Regex};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -82,16 +83,7 @@ fn replace_all(
     for link in find_links(s) {
         replaced.push_str(&s[previous_end_index..link.start_index]);
 
-        let target = path
-            .join(&link.path)
-            .canonicalize()
-            .with_context(|| format!("{}/{}", path.display(), link.path.display()))
-            .unwrap();
-        targets.push_str(" \"");
-        targets.push_str(&target.to_string_lossy());
-        targets.push('"');
-
-        match link.render() {
+        match link.render(path, targets) {
             Ok(new_content) => {
                 if depth < MAX_LINK_NESTED_DEPTH {
                     let rel_path = return_relative_path(path, &link.path);
@@ -129,8 +121,7 @@ fn replace_all(
 }
 
 fn return_relative_path(base: &Path, relative: &Path) -> PathBuf {
-    base
-        .join(relative)
+    base.join(relative)
         .parent()
         .expect("Included file should not be /")
         .to_path_buf()
@@ -164,13 +155,29 @@ impl<'a> Link<'a> {
         })
     }
 
-    fn render(&self) -> Result<String> {
-        let image = Path::new(
-            self.path
-                .file_name()
-                .with_context(|| "plantuml path was not file")?,
-        )
-        .with_extension(SVG);
+    fn render(&self, base: &Path, targets: &mut String) -> Result<String> {
+        let target = base
+            .join(&self.path)
+            .canonicalize()
+            .with_context(|| format!("{}/{}", base.display(), self.path.display()))
+            .unwrap();
+        targets.push_str(" \"");
+        targets.push_str(&target.to_string_lossy());
+        targets.push('"');
+
+        let f = std::fs::File::open(target)?;
+        let mut buf = BufReader::new(f);
+        let mut line = String::new();
+        buf.read_line(&mut line)?;
+        let image = match find_name(&line) {
+            Some(name) => Path::new(&name).with_extension(SVG),
+            None => Path::new(
+                self.path
+                    .file_name()
+                    .with_context(|| "plantuml path was not file")?,
+            )
+            .with_extension(SVG),
+        };
 
         Ok(format!(
             r#"<img src="/{}/{}" />"#,
@@ -211,6 +218,16 @@ fn find_links(contents: &str) -> LinkIter<'_> {
         .unwrap();
     }
     LinkIter(RE.captures_iter(contents))
+}
+
+fn find_name(contents: &str) -> Option<String> {
+    lazy_static! {
+        static ref RE: Regex = Regex::new(r"^@startuml(.*)").unwrap();
+    }
+    RE.captures(contents)
+        .and_then(|cap| cap.get(1))
+        .and_then(|m| m.as_str().strip_prefix(' '))
+        .map(str::to_owned)
 }
 
 #[cfg(test)]
