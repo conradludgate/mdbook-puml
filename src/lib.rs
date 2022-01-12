@@ -1,23 +1,24 @@
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, FindIter, MatchKind};
 use anyhow::{bail, Context, Result};
 use lazy_static::lazy_static;
 use mdbook::book::Book;
 use mdbook::preprocess::{Preprocessor, PreprocessorContext};
 use mdbook::BookItem;
-use regex::{CaptureMatches, Captures, Regex};
-use std::io::{BufRead, BufReader};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hasher;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tempfile::{tempdir, TempDir};
+use uuid::Uuid;
 
 #[macro_use]
 extern crate log;
 
-const MAX_LINK_NESTED_DEPTH: usize = 10;
 const REL_OUTDIR: &str = "plantuml_images";
 const SVG: &str = "svg";
+const PUML: &str = "puml";
 
-/// A preprocessor for expanding helpers in a chapter. Supported helpers are:
-///
-/// - `{{# plantuml}}` - Insert a link to the rendered plantuml file
+/// A preprocessor for prerendering plantuml as images
 pub struct PumlPreprocessor;
 
 impl Preprocessor for PumlPreprocessor {
@@ -28,33 +29,66 @@ impl Preprocessor for PumlPreprocessor {
     fn run(&self, ctx: &PreprocessorContext, mut book: Book) -> Result<Book> {
         let src_dir = ctx.root.join(&ctx.config.book.src);
         let outdir = src_dir.join(REL_OUTDIR);
+        std::fs::create_dir_all(&outdir)
+            .with_context(|| format!("could not create {}", outdir.display()))?;
 
-        let mut plantuml_script = format!("plantuml -t{} -o {} -nometadata", SVG, outdir.display());
+        let compiler = Compiler {
+            tmpdir: tempdir()?,
+            outdir,
+        };
 
         book.for_each_mut(|section: &mut BookItem| {
             if let BookItem::Chapter(ref mut ch) = *section {
-                if let Some(ref chapter_path) = ch.path {
-                    let base = chapter_path
-                        .parent()
-                        .map(|dir| src_dir.join(dir))
-                        .expect("All book items have a parent");
-
-                    let content = replace_all(
-                        &ch.content,
-                        &base,
-                        chapter_path,
-                        &outdir,
-                        0,
-                        &mut plantuml_script,
-                    );
-                    ch.content = content;
-                }
+                let depth = ch.path.as_ref().unwrap().components().count();
+                let content = compiler.replace_all(&ch.content, depth - 1);
+                ch.content = content;
             }
         });
 
+        Ok(book)
+    }
+}
+
+#[derive(Debug, PartialEq, Clone)]
+struct Target<'a> {
+    output: Uuid,
+    input: &'a str,
+    name: Option<&'a str>,
+    output_type: &'static str,
+}
+
+struct Compiler {
+    tmpdir: TempDir,
+    outdir: PathBuf,
+}
+
+impl Compiler {
+    fn compile(&self, target: Target) -> Result<()> {
+        let filename = target.output.to_string();
+        let filename = Path::new(&filename);
+        let outfile = self
+            .outdir
+            .join(filename.with_extension(target.output_type));
+
+        // check if we have it cached
+        if outfile.exists() {
+            info!("{} exists. returning early", target.output);
+            return Ok(());
+        }
+
+        // write the puml contents to a tmp file
+        let input = self.tmpdir.path().join(filename.with_extension(PUML));
+        std::fs::write(&input, &target.input).with_context(|| "could not create tmp puml file")?;
+
+        // execute plantuml cli
+        let script = format!(
+            "plantuml -t{} -nometadata {}",
+            target.output_type,
+            input.display(),
+        );
         let status = Command::new("sh")
             .arg("-c")
-            .arg(plantuml_script)
+            .arg(script)
             .status()
             .with_context(|| "could not run plantuml")?;
 
@@ -62,172 +96,132 @@ impl Preprocessor for PumlPreprocessor {
             bail!("could not run plantuml");
         }
 
-        Ok(book)
+        // move the compiled file to the outdir
+        let output = match &target.name {
+            Some(name) => Path::new(name),
+            None => filename,
+        };
+        let output = self
+            .tmpdir
+            .path()
+            .join(output.with_extension(target.output_type));
+        std::fs::rename(output, outfile)
+            .with_context(|| "could not move compiled file to ourdir")?;
+
+        Ok(())
     }
-}
 
-fn replace_all(
-    s: &str,
-    path: &Path,
-    source: &Path,
-    outdir: &Path,
-    depth: usize,
-    targets: &mut String,
-) -> String {
-    // When replacing one thing in a string by something with a different length,
-    // the indices after that will not correspond,
-    // we therefore have to store the difference to correct this
-    let mut previous_end_index = 0;
-    let mut replaced = String::new();
+    fn replace_all(&self, s: &str, depth: usize) -> String {
+        // When replacing one thing in a string by something with a different length,
+        // the indices after that will not correspond,
+        // we therefore have to store the difference to correct this
+        let mut previous_end_index = 0;
+        let mut replaced = String::new();
 
-    for link in find_links(s) {
-        replaced.push_str(&s[previous_end_index..link.start_index]);
+        for link in find_pumls(s) {
+            replaced.push_str(&s[previous_end_index..link.start]);
 
-        match link.render(path, targets) {
-            Ok(new_content) => {
-                if depth < MAX_LINK_NESTED_DEPTH {
-                    let rel_path = return_relative_path(path, &link.path);
-                    replaced.push_str(&replace_all(
-                        &new_content,
-                        &rel_path,
-                        source,
-                        outdir,
-                        depth + 1,
-                        targets,
-                    ));
-                } else {
-                    error!(
-                        "Stack depth exceeded in {}. Check for cyclic includes",
-                        source.display()
-                    );
+            match link.render(self, depth) {
+                Ok(new_content) => {
+                    replaced.push_str(&new_content);
+                    previous_end_index = link.end;
                 }
-                previous_end_index = link.end_index;
-            }
-            Err(e) => {
-                error!("Error updating \"{}\", {}", link.link_text, e);
-                for cause in e.chain().skip(1) {
-                    warn!("Caused By: {}", cause);
-                }
+                Err(e) => {
+                    error!("Error updating \"{}\", {}", link.contents, e);
+                    for cause in e.chain().skip(1) {
+                        warn!("Caused By: {}", cause);
+                    }
 
-                // This should make sure we include the raw `{{# ... }}` snippet
-                // in the page content if there are any errors.
-                previous_end_index = link.start_index;
+                    // This should make sure we include the raw `{{# ... }}` snippet
+                    // in the page content if there are any errors.
+                    previous_end_index = link.start;
+                }
             }
         }
+
+        replaced.push_str(&s[previous_end_index..]);
+        replaced
     }
-
-    replaced.push_str(&s[previous_end_index..]);
-    replaced
-}
-
-fn return_relative_path(base: &Path, relative: &Path) -> PathBuf {
-    base.join(relative)
-        .parent()
-        .expect("Included file should not be /")
-        .to_path_buf()
 }
 
 #[derive(PartialEq, Debug, Clone)]
-struct Link<'a> {
-    start_index: usize,
-    end_index: usize,
-    path: PathBuf,
-    link_text: &'a str,
+struct Puml<'a> {
+    start: usize,
+    end: usize,
+    contents: &'a str,
 }
 
-impl<'a> Link<'a> {
-    fn from_capture(cap: Captures<'a>) -> Option<Link<'a>> {
-        let path = match cap.get(1) {
-            Some(rest) => {
-                let mut path_props = rest.as_str().split_whitespace();
-                path_props.next().map(PathBuf::from)
-            }
-            _ => None,
-        };
+impl<'a> Puml<'a> {
+    fn uuid(&self) -> Uuid {
+        let mut hasher = DefaultHasher::new();
+        hasher.write(self.contents.as_bytes());
 
-        path.and_then(|path| {
-            cap.get(0).map(|mat| Link {
-                start_index: mat.start(),
-                end_index: mat.end(),
-                path,
-                link_text: mat.as_str(),
-            })
-        })
+        let lhs = hasher.finish() as u128;
+        hasher.write_u8(0);
+        let rhs = hasher.finish() as u128;
+        Uuid::from_u128(lhs << 64 | rhs)
     }
 
-    fn render(&self, base: &Path, targets: &mut String) -> Result<String> {
-        let target = base
-            .join(&self.path)
-            .canonicalize()
-            .with_context(|| format!("{}/{}", base.display(), self.path.display()))
-            .unwrap();
-        targets.push_str(" \"");
-        targets.push_str(&target.to_string_lossy());
-        targets.push('"');
-
-        let f = std::fs::File::open(target)?;
-        let mut buf = BufReader::new(f);
-        let mut line = String::new();
-        buf.read_line(&mut line)?;
-        let image = match find_name(&line) {
-            Some(name) => Path::new(&name).with_extension(SVG),
-            None => Path::new(
-                self.path
-                    .file_name()
-                    .with_context(|| "plantuml path was not file")?,
-            )
-            .with_extension(SVG),
-        };
+    fn render(&self, compiler: &Compiler, depth: usize) -> Result<String> {
+        let uuid = self.uuid();
+        let name = find_name(self.contents);
+        compiler.compile(Target {
+            output: uuid,
+            input: self.contents,
+            name,
+            output_type: SVG,
+        })?;
 
         Ok(format!(
-            r#"<img src="/{}/{}" />"#,
-            REL_OUTDIR,
-            image.display()
+            r#"![{}]({}{}/{}.{})"#,
+            name.unwrap_or(""),
+            "../".repeat(depth), // traverse up `depth` folders
+            REL_OUTDIR,          // go into the relative image outdir
+            uuid,                // with the uuid as the filename
+            SVG                  // and svg file extension
         ))
     }
 }
 
-struct LinkIter<'a>(CaptureMatches<'a, 'a>);
+struct PumlIter<'a>(&'a str, FindIter<'a, 'a, usize>);
 
-impl<'a> Iterator for LinkIter<'a> {
-    type Item = Link<'a>;
-    fn next(&mut self) -> Option<Link<'a>> {
-        for cap in &mut self.0 {
-            if let Some(inc) = Link::from_capture(cap) {
-                return Some(inc);
+impl<'a> Iterator for PumlIter<'a> {
+    type Item = Puml<'a>;
+    fn next(&mut self) -> Option<Puml<'a>> {
+        let start = loop {
+            let m = self.1.next()?;
+            if m.pattern() == 0 {
+                break m;
             }
-        }
-        None
+        };
+
+        let end = self.1.next()?;
+        Some(Puml {
+            start: start.start(),
+            end: end.end(),
+            contents: &self.0[start.end()..end.start()],
+        })
     }
 }
 
-fn find_links(contents: &str) -> LinkIter<'_> {
+fn find_pumls(contents: &str) -> PumlIter<'_> {
     // lazily compute following regex
     // r"\\\{\{#plantuml\}\}|\{\{#plantuml\s*([^}]+)\}\}")?;
     lazy_static! {
-        static ref RE: Regex = Regex::new(
-            r"(?x)              # insignificant whitespace mode
-            \\\{\{\#plantuml\}\}      # match escaped link
-            |                   # or
-            \{\{\s*             # link opening parens and whitespace
-            \#plantuml          # link type
-            \s+                 # separating whitespace
-            ([^}]+)             # link target path and space separated properties
-            \}\}                # link closing parens"
-        )
-        .unwrap();
+        static ref AC: AhoCorasick = AhoCorasickBuilder::new()
+            .match_kind(MatchKind::LeftmostLongest)
+            .build(["```plantuml\n", "```"]);
     }
-    LinkIter(RE.captures_iter(contents))
+    PumlIter(contents, AC.find_iter(contents))
 }
 
-fn find_name(contents: &str) -> Option<String> {
-    lazy_static! {
-        static ref RE: Regex = Regex::new(r"^@startuml(.*)").unwrap();
-    }
-    RE.captures(contents)
-        .and_then(|cap| cap.get(1))
-        .and_then(|m| m.as_str().strip_prefix(' '))
-        .map(str::to_owned)
+fn find_name(contents: &str) -> Option<&str> {
+    contents
+        .strip_prefix("@startuml ")
+        .map(|m| match m.find('\n') {
+            Some(i) => &m[..i],
+            None => m,
+        })
 }
 
 #[cfg(test)]
@@ -235,26 +229,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_find_links_simple_link() {
-        let s = "Some random text with {{#plantuml file.puml}} and {{#plantuml ../nested/test.puml }}...";
+    fn test_find_plantuml() {
+        let s = r#"Some random text with
+```plantuml
+@startuml Document Name
 
-        let res = find_links(s).collect::<Vec<_>>();
-        println!("\nOUTPUT: {:?}\n", res);
+UML <-> Document
+
+@enduml
+```
+
+and
+
+```rust
+let foo = "bar";
+```
+
+```plantuml
+@startuml Another Doc
+Foo
+@enduml
+```
+..."#;
+
+        let res = find_pumls(s).collect::<Vec<_>>();
 
         assert_eq!(
             res,
             vec![
-                Link {
-                    start_index: 22,
-                    end_index: 45,
-                    path: PathBuf::from("file.puml"),
-                    link_text: "{{#plantuml file.puml}}",
+                Puml {
+                    start: 22,
+                    end: 88,
+                    contents: "@startuml Document Name\n\nUML <-> Document\n\n@enduml\n",
                 },
-                Link {
-                    start_index: 50,
-                    end_index: 84,
-                    path: PathBuf::from("../nested/test.puml"),
-                    link_text: "{{#plantuml ../nested/test.puml }}",
+                Puml {
+                    start: 125,
+                    end: 174,
+                    contents: "@startuml Another Doc\nFoo\n@enduml\n",
                 },
             ]
         );
@@ -264,22 +275,49 @@ mod tests {
     fn replace() {
         env_logger::init();
 
-        let root = std::env::current_dir().unwrap();
+        let s = r#"Some random text with
+```plantuml
+@startuml Document Name
 
-        let s = "Some random text with {{#plantuml file.puml}} and {{#plantuml ../nested/test.puml }}...";
-        let path = root.join("src");
-        let source = PathBuf::from("foo.md");
-        let outdir = path.join("plantuml_images");
+UML <-> Document
 
-        let mut targets = String::new();
+@enduml
+```
 
-        let res = replace_all(s, &path, &source, &outdir, 0, &mut targets);
+and
 
-        println!("\nOUTPUT: {:?}\n", res);
+```rust
+let foo = "bar";
+```
+
+```plantuml
+@startuml
+Foo <-> Bar
+@enduml
+```
+..."#;
+
+        let tmp = tempdir().unwrap();
+        let compiler = Compiler {
+            tmpdir: tempdir().unwrap(),
+            outdir: tmp.path().to_owned(),
+        };
+
+        let res = compiler.replace_all(s, 2);
 
         assert_eq!(
             res,
-            "Some random text with <img src=\"/plantuml_images/file.svg\" /> and <img src=\"/plantuml_images/test.svg\" />..."
+            r#"Some random text with
+![Document Name](../../plantuml_images/bd15ddc5-f769-719d-dbb5-be1228872d69.svg)
+
+and
+
+```rust
+let foo = "bar";
+```
+
+![](../../plantuml_images/3a1375f3-0f44-4b13-f722-de95a4661ce7.svg)
+..."#
         );
     }
 }
