@@ -149,6 +149,7 @@ struct Puml<'a> {
     start: usize,
     end: usize,
     contents: &'a str,
+    ignore: bool,
 }
 
 impl<'a> Puml<'a> {
@@ -163,6 +164,11 @@ impl<'a> Puml<'a> {
     }
 
     fn render(&self, compiler: &Compiler, depth: usize) -> Result<String> {
+        if self.ignore {
+            return Ok(format!(r#"```plantuml
+{}```"#, self.contents));
+        }
+
         let uuid = self.uuid();
         let name = find_name(self.contents);
         compiler.compile(Target {
@@ -190,7 +196,7 @@ impl<'a> Iterator for PumlIter<'a> {
     fn next(&mut self) -> Option<Puml<'a>> {
         let start = loop {
             let m = self.1.next()?;
-            if m.pattern() == 0 {
+            if m.pattern() != 1 {
                 break m;
             }
         };
@@ -200,6 +206,7 @@ impl<'a> Iterator for PumlIter<'a> {
             start: start.start(),
             end: end.end(),
             contents: &self.0[start.end()..end.start()],
+            ignore: start.pattern() == 2,
         })
     }
 }
@@ -210,7 +217,7 @@ fn find_pumls(contents: &str) -> PumlIter<'_> {
     lazy_static! {
         static ref AC: AhoCorasick = AhoCorasickBuilder::new()
             .match_kind(MatchKind::LeftmostLongest)
-            .build(["```plantuml\n", "```"]);
+            .build(["```plantuml\n", "```", "```plantuml,ignore\n"]);
     }
     PumlIter(contents, AC.find_iter(contents))
 }
@@ -250,7 +257,13 @@ let foo = "bar";
 Foo
 @enduml
 ```
-..."#;
+
+```plantuml,ignore
+@startuml
+Foo <-> Bar
+@enduml
+```
+"#;
 
         let res = find_pumls(s).collect::<Vec<_>>();
 
@@ -261,11 +274,19 @@ Foo
                     start: 22,
                     end: 88,
                     contents: "@startuml Document Name\n\nUML <-> Document\n\n@enduml\n",
+                    ignore: false,
                 },
                 Puml {
                     start: 125,
                     end: 174,
                     contents: "@startuml Another Doc\nFoo\n@enduml\n",
+                    ignore: false,
+                },
+                Puml {
+                    start: 176,
+                    end: 228,
+                    contents: "@startuml\nFoo <-> Bar\n@enduml\n",
+                    ignore: true,
                 },
             ]
         );
@@ -295,7 +316,13 @@ let foo = "bar";
 Foo <-> Bar
 @enduml
 ```
-..."#;
+
+```plantuml,ignore
+@startuml
+Foo <-> Bar
+@enduml
+```
+"#;
 
         let tmp = tempdir().unwrap();
         let compiler = Compiler {
@@ -317,7 +344,13 @@ let foo = "bar";
 ```
 
 ![](../../plantuml_images/3a1375f3-0f44-4b13-f722-de95a4661ce7.svg)
-..."#
+
+```plantuml
+@startuml
+Foo <-> Bar
+@enduml
+```
+"#
         );
     }
 }
