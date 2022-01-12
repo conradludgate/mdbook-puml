@@ -8,7 +8,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tempfile::{tempdir, TempDir};
+use tempfile::TempDir;
 use uuid::Uuid;
 
 #[macro_use]
@@ -33,7 +33,7 @@ impl Preprocessor for PumlPreprocessor {
             .with_context(|| format!("could not create {}", outdir.display()))?;
 
         let compiler = Compiler {
-            tmpdir: tempdir()?,
+            tmpdir: TempDir::new_in(src_dir)?,
             outdir,
         };
 
@@ -105,8 +105,13 @@ impl Compiler {
             .tmpdir
             .path()
             .join(output.with_extension(target.output_type));
-        std::fs::rename(output, outfile)
-            .with_context(|| "could not move compiled file to ourdir")?;
+        std::fs::rename(&output, &outfile).with_context(|| {
+            format!(
+                "could not move compiled file ({}) to outdir ({})",
+                output.display(),
+                outfile.display()
+            )
+        })?;
 
         Ok(())
     }
@@ -165,8 +170,11 @@ impl<'a> Puml<'a> {
 
     fn render(&self, compiler: &Compiler, depth: usize) -> Result<String> {
         if self.ignore {
-            return Ok(format!(r#"```plantuml
-{}```"#, self.contents));
+            return Ok(format!(
+                r#"```plantuml
+{}```"#,
+                self.contents
+            ));
         }
 
         let uuid = self.uuid();
@@ -324,9 +332,9 @@ Foo <-> Bar
 ```
 "#;
 
-        let tmp = tempdir().unwrap();
+        let tmp = TempDir::new().unwrap();
         let compiler = Compiler {
-            tmpdir: tempdir().unwrap(),
+            tmpdir: TempDir::new().unwrap(),
             outdir: tmp.path().to_owned(),
         };
 
