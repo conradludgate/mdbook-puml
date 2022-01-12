@@ -8,7 +8,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tempfile::tempdir;
+use tempfile::{tempdir, TempDir};
 use uuid::Uuid;
 
 #[macro_use]
@@ -32,43 +32,38 @@ impl Preprocessor for PumlPreprocessor {
         std::fs::create_dir_all(&outdir)
             .with_context(|| format!("could not create {}", outdir.display()))?;
 
-        let mut targets = vec![];
-
-        book.for_each_mut(|section: &mut BookItem| {
-            if let BookItem::Chapter(ref mut ch) = *section {
-                let content = replace_all(&ch.content, &mut targets);
-                ch.content = content;
-            }
-        });
-
         let compiler = Compiler {
-            tmpdir: tempdir()?.into_path(),
+            tmpdir: tempdir()?,
             outdir,
         };
 
-        targets
-            .iter()
-            .try_for_each(|target| compiler.compile(target))?;
+        book.for_each_mut(|section: &mut BookItem| {
+            if let BookItem::Chapter(ref mut ch) = *section {
+                let depth = ch.path.as_ref().unwrap().components().count();
+                let content = compiler.replace_all(&ch.content, depth - 1);
+                ch.content = content;
+            }
+        });
 
         Ok(book)
     }
 }
 
 #[derive(Debug, PartialEq, Clone)]
-struct Target {
+struct Target<'a> {
     output: Uuid,
-    input: String,
-    name: Option<String>,
+    input: &'a str,
+    name: Option<&'a str>,
     output_type: &'static str,
 }
 
 struct Compiler {
-    tmpdir: PathBuf,
+    tmpdir: TempDir,
     outdir: PathBuf,
 }
 
 impl Compiler {
-    fn compile(&self, target: &Target) -> Result<()> {
+    fn compile(&self, target: Target) -> Result<()> {
         let filename = target.output.to_string();
         let filename = Path::new(&filename);
         let outfile = self
@@ -82,7 +77,7 @@ impl Compiler {
         }
 
         // write the puml contents to a tmp file
-        let input = self.tmpdir.join(filename.with_extension(PUML));
+        let input = self.tmpdir.path().join(filename.with_extension(PUML));
         std::fs::write(&input, &target.input).with_context(|| "could not create tmp puml file")?;
 
         // execute plantuml cli
@@ -103,47 +98,50 @@ impl Compiler {
 
         // move the compiled file to the outdir
         let output = match &target.name {
-            Some(name) => Path::new(name.as_str()),
+            Some(name) => Path::new(name),
             None => filename,
         };
-        let output = self.tmpdir.join(output.with_extension(target.output_type));
+        let output = self
+            .tmpdir
+            .path()
+            .join(output.with_extension(target.output_type));
         std::fs::rename(output, outfile)
             .with_context(|| "could not move compiled file to ourdir")?;
 
         Ok(())
     }
-}
 
-fn replace_all(s: &str, targets: &mut Vec<Target>) -> String {
-    // When replacing one thing in a string by something with a different length,
-    // the indices after that will not correspond,
-    // we therefore have to store the difference to correct this
-    let mut previous_end_index = 0;
-    let mut replaced = String::new();
+    fn replace_all(&self, s: &str, depth: usize) -> String {
+        // When replacing one thing in a string by something with a different length,
+        // the indices after that will not correspond,
+        // we therefore have to store the difference to correct this
+        let mut previous_end_index = 0;
+        let mut replaced = String::new();
 
-    for link in find_pumls(s) {
-        replaced.push_str(&s[previous_end_index..link.start]);
+        for link in find_pumls(s) {
+            replaced.push_str(&s[previous_end_index..link.start]);
 
-        match link.render(targets) {
-            Ok(new_content) => {
-                replaced.push_str(&new_content);
-                previous_end_index = link.end;
-            }
-            Err(e) => {
-                error!("Error updating \"{}\", {}", link.contents, e);
-                for cause in e.chain().skip(1) {
-                    warn!("Caused By: {}", cause);
+            match link.render(self, depth) {
+                Ok(new_content) => {
+                    replaced.push_str(&new_content);
+                    previous_end_index = link.end;
                 }
+                Err(e) => {
+                    error!("Error updating \"{}\", {}", link.contents, e);
+                    for cause in e.chain().skip(1) {
+                        warn!("Caused By: {}", cause);
+                    }
 
-                // This should make sure we include the raw `{{# ... }}` snippet
-                // in the page content if there are any errors.
-                previous_end_index = link.start;
+                    // This should make sure we include the raw `{{# ... }}` snippet
+                    // in the page content if there are any errors.
+                    previous_end_index = link.start;
+                }
             }
         }
-    }
 
-    replaced.push_str(&s[previous_end_index..]);
-    replaced
+        replaced.push_str(&s[previous_end_index..]);
+        replaced
+    }
 }
 
 #[derive(PartialEq, Debug, Clone)]
@@ -164,16 +162,24 @@ impl<'a> Puml<'a> {
         Uuid::from_u128(lhs << 64 | rhs)
     }
 
-    fn render(&self, targets: &mut Vec<Target>) -> Result<String> {
+    fn render(&self, compiler: &Compiler, depth: usize) -> Result<String> {
         let uuid = self.uuid();
-        targets.push(Target {
+        let name = find_name(self.contents);
+        compiler.compile(Target {
             output: uuid,
-            input: self.contents.to_owned(),
-            name: find_name(self.contents),
+            input: self.contents,
+            name,
             output_type: SVG,
-        });
+        })?;
 
-        Ok(format!(r#"<img src="/{}/{}.{}" />"#, REL_OUTDIR, uuid, SVG))
+        Ok(format!(
+            r#"![{}]({}{}/{}.{})"#,
+            name.unwrap_or(""),
+            "../".repeat(depth), // traverse up `depth` folders
+            REL_OUTDIR,          // go into the relative image outdir
+            uuid,                // with the uuid as the filename
+            SVG                  // and svg file extension
+        ))
     }
 }
 
@@ -209,13 +215,13 @@ fn find_pumls(contents: &str) -> PumlIter<'_> {
     PumlIter(contents, AC.find_iter(contents))
 }
 
-fn find_name(contents: &str) -> Option<String> {
-    contents.strip_prefix("@startuml ").map(|m| {
-        match m.find('\n') {
-            Some(i) => m[..i].to_owned(),
-            None => m.to_owned(),
-        }
-    })
+fn find_name(contents: &str) -> Option<&str> {
+    contents
+        .strip_prefix("@startuml ")
+        .map(|m| match m.find('\n') {
+            Some(i) => &m[..i],
+            None => m,
+        })
 }
 
 #[cfg(test)]
@@ -286,19 +292,23 @@ let foo = "bar";
 
 ```plantuml
 @startuml
-Foo
+Foo <-> Bar
 @enduml
 ```
 ..."#;
 
-        let mut targets = Vec::new();
+        let tmp = tempdir().unwrap();
+        let compiler = Compiler {
+            tmpdir: tempdir().unwrap(),
+            outdir: tmp.path().to_owned(),
+        };
 
-        let res = replace_all(s, &mut targets);
+        let res = compiler.replace_all(s, 2);
 
         assert_eq!(
             res,
             r#"Some random text with
-<img src="/plantuml_images/bd15ddc5-f769-719d-dbb5-be1228872d69.svg" />
+![Document Name](../../plantuml_images/bd15ddc5-f769-719d-dbb5-be1228872d69.svg)
 
 and
 
@@ -306,26 +316,8 @@ and
 let foo = "bar";
 ```
 
-<img src="/plantuml_images/8ce939d4-4d6b-5966-2d76-7b57c6c9b157.svg" />
+![](../../plantuml_images/3a1375f3-0f44-4b13-f722-de95a4661ce7.svg)
 ..."#
         );
-
-        assert_eq!(
-            targets,
-            vec![
-                Target {
-                    output: Uuid::from_u128(0x_bd15ddc5_f769_719d_dbb5_be1228872d69),
-                    input: "@startuml Document Name\n\nUML <-> Document\n\n@enduml\n".to_owned(),
-                    name: Some("Document Name".to_owned()),
-                    output_type: SVG
-                },
-                Target {
-                    output: Uuid::from_u128(0x_8ce939d4_4d6b_5966_2d76_7b57c6c9b157),
-                    input: "@startuml\nFoo\n@enduml\n".to_owned(),
-                    name: None,
-                    output_type: SVG
-                }
-            ]
-        )
     }
 }
