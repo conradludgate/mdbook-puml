@@ -1,5 +1,5 @@
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, FindIter, MatchKind};
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use lazy_static::lazy_static;
 use mdbook::book::Book;
 use mdbook::preprocess::{Preprocessor, PreprocessorContext};
@@ -37,16 +37,32 @@ impl Preprocessor for PumlPreprocessor {
             outdir,
         };
 
-        book.for_each_mut(|section: &mut BookItem| {
+        try_for_each_mut(&mut book.sections, &mut |section: &mut BookItem| {
             if let BookItem::Chapter(ref mut ch) = *section {
                 let depth = ch.path.as_ref().unwrap().components().count();
-                let content = compiler.replace_all(&ch.content, depth - 1);
+                let content = compiler.replace_all(&ch.content, depth - 1)?;
                 ch.content = content;
             }
-        });
+            Ok(())
+        })?;
 
         Ok(book)
     }
+}
+
+pub fn try_for_each_mut<'a, F, I>(items: I, func: &mut F) -> Result<()>
+where
+    F: FnMut(&mut BookItem) -> Result<()>,
+    I: IntoIterator<Item = &'a mut BookItem>,
+{
+    for item in items {
+        if let BookItem::Chapter(ch) = item {
+            try_for_each_mut(&mut ch.sub_items, func)?;
+        }
+
+        func(item)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -86,14 +102,20 @@ impl Compiler {
             target.output_type,
             input.display(),
         );
-        let status = Command::new("sh")
+        let output = Command::new("sh")
             .arg("-c")
             .arg(script)
-            .status()
-            .with_context(|| "could not run plantuml")?;
+            .output()
+            .with_context(|| "could not invoke plantuml")?;
 
-        if !status.success() {
-            bail!("could not run plantuml");
+        if !output.status.success() {
+            let mut err = anyhow!("{}", target.input);
+
+            if let Ok(stderr) = String::from_utf8(output.stderr) {
+                err = err.context(stderr)
+            }
+
+            return Err(err.context("could not compile plantuml"));
         }
 
         // move the compiled file to the outdir
@@ -116,7 +138,7 @@ impl Compiler {
         Ok(())
     }
 
-    fn replace_all(&self, s: &str, depth: usize) -> String {
+    fn replace_all(&self, s: &str, depth: usize) -> Result<String> {
         // When replacing one thing in a string by something with a different length,
         // the indices after that will not correspond,
         // we therefore have to store the difference to correct this
@@ -126,26 +148,13 @@ impl Compiler {
         for link in find_pumls(s) {
             replaced.push_str(&s[previous_end_index..link.start]);
 
-            match link.render(self, depth) {
-                Ok(new_content) => {
-                    replaced.push_str(&new_content);
-                    previous_end_index = link.end;
-                }
-                Err(e) => {
-                    error!("Error updating \"{}\", {}", link.contents, e);
-                    for cause in e.chain().skip(1) {
-                        warn!("Caused By: {}", cause);
-                    }
-
-                    // This should make sure we include the raw `{{# ... }}` snippet
-                    // in the page content if there are any errors.
-                    previous_end_index = link.start;
-                }
-            }
+            let new_content = link.render(self, depth)?;
+            replaced.push_str(&new_content);
+            previous_end_index = link.end;
         }
 
         replaced.push_str(&s[previous_end_index..]);
-        replaced
+        Ok(replaced)
     }
 }
 
@@ -338,7 +347,7 @@ Foo <-> Bar
             outdir: tmp.path().to_owned(),
         };
 
-        let res = compiler.replace_all(s, 2);
+        let res = compiler.replace_all(s, 2).unwrap();
 
         assert_eq!(
             res,

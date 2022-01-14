@@ -15,7 +15,7 @@ pub fn make_app() -> App<'static, 'static> {
         )
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     env_logger::init();
 
     let matches = make_app().get_matches();
@@ -23,10 +23,9 @@ fn main() {
     let preprocessor = mdbook_puml::PumlPreprocessor;
 
     if let Some(sub_args) = matches.subcommand_matches("supports") {
-        handle_supports(&preprocessor, sub_args);
-    } else if let Err(e) = handle_preprocessing(&preprocessor) {
-        eprintln!("{}", e);
-        process::exit(1);
+        handle_supports(&preprocessor, sub_args)
+    } else {
+        handle_preprocessing(&preprocessor)
     }
 }
 
